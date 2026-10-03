@@ -53,6 +53,26 @@ is 409, structural violations and fewer than two free event slots are 422.
 On success the source reads deleted, the target holds the source value, and
 every other key's verdict is unchanged; on failure the history is untouched.
 
+A replica-admission endpoint (/api/histories/{id}/replicas) lets an already
+created persistent history accept a brand-new replica without closing any
+existing import session.  Given the history id and the new replica id, the
+replica is appended to ``replica_ids`` and every committed event -- plus the
+staged events of every open and every closed session of that history --
+receives one extra clock component for the new replica set to 0; existing
+seqs, keys, operations, values, clock components, session ids and statuses
+are untouched, so key states and values do not change and the new replica
+may write from seq 1.  The history row and all its session rows are
+rewritten in one serialised transaction together with the history row lock,
+so reads see only the complete before or after state (never a mix of the two
+replica sets) and a concurrent legacy merge, staging append or session
+commit cannot lose events.  Staging is allowed to be missing dependencies,
+and admission never blocks on complete-batch validation.  Unknown history
+is 404, an already-present replica is 409, an empty id or a join beyond 8
+replicas is 422.  Subsequent writes still follow the ordinary full-clock
+rules (a request missing the new component is a normal 422, never
+auto-filled), other histories are unaffected, the result survives restarts,
+and replicas can only be joined -- never removed or renamed.
+
 A third family of endpoints (/api/histories/{id}/import-sessions) stages
 offline events that arrive in several batches into an import session before
 they touch the persistent history.  A session is created empty by history
@@ -317,6 +337,29 @@ class MergeEventsRequest(BaseModel):
     events: Annotated[
         list[Event],
         Field(min_length=1, max_length=120, description="1-120 events to merge, any order."),
+    ]
+
+
+class JoinReplicaRequest(BaseModel):
+    """A new replica admitted to an existing persistent history.
+
+    Only the new replica ID is supplied.  The admission appends it to the
+    history's ``replica_ids`` and gives every committed and staged event a
+    zero component for it; replicas can only be joined -- never removed or
+    renamed -- and a history holds at most 8 replicas.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    replica_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            description=(
+                "Non-empty ID of the replica joining the history; must not "
+                "already be one of the history's replica_ids."
+            ),
+        ),
     ]
 
 
@@ -899,6 +942,31 @@ def _merge_events(
     # Re-run the original validation on the whole merged history.
     validate_batch(replica_ids, merged)
     return merged
+
+
+def _events_with_extra_zero_component(
+    events: list[Event], new_replica: str
+) -> list[Event]:
+    """Give every event one extra clock component for a newly joined replica.
+
+    The new component is appended (its value is 0: the events predate the
+    replica's existence, so none of them knew anything from it); every
+    existing component, key/op/value, seq and identity stay byte-for-byte
+    unchanged.  A zero self-component is exactly what a replica with no
+    events of its own carries, so the enlarged history still passes the
+    original batch validation with the replica included.  Causal comparisons
+    gain one equal (0/0) component, which never changes the partial order, so
+    every key's state and value verdict is unchanged.
+    """
+
+    enlarged: list[Event] = []
+    for ev in events:
+        clock = dict(ev.clock)
+        clock[new_replica] = 0
+        enlarged.append(
+            ev.model_copy(update={"clock": clock})
+        )
+    return enlarged
 
 
 def _stage_events(
@@ -2532,6 +2600,111 @@ def migrate_history_key(history_id: str, body: KeyMigrationRequest) -> dict:
         }
 
 
+@app.post(
+    "/api/histories/{history_id}/replicas",
+    tags=["histories"],
+    response_model=None,
+)
+def admit_history_replica(history_id: str, body: JoinReplicaRequest) -> dict:
+    """Admit one new replica into a persistent history.
+
+    The replica is appended to ``replica_ids``; every already committed event
+    and every staged event of *every* import session of this history (open or
+    closed) gains one extra clock component for the new replica set to 0 --
+    nothing else changes: seqs, keys, operations, values, existing clock
+    components, session IDs and session statuses all stay as they were.  The
+    new replica starts empty, so it may subsequently write from seq 1.
+
+    The history row and every one of its session rows are rewritten inside
+    one serialised ``BEGIN IMMEDIATE`` transaction, together with the history
+    row lock that all other writers take, so the enlargement takes effect at
+    once: reads see either the pre-admission or the post-admission state and
+    can never mix the two replica sets, and a concurrent legacy merge,
+    conflict commit, key migration or session commit cannot lose events.
+
+    Admission never validates the staged contents as a complete batch (a
+    staging area is allowed to be missing dependencies); it only enlarges
+    clocks.  Writes made afterwards are still checked by the ordinary full
+    clock rules against the enlarged replica set -- a request missing the new
+    component is a normal 422, it is not auto-filled.  Only joining is
+    supported: replicas cannot be removed or renamed.  Unknown history ->
+    404; the replica is already present -> 409; an empty/missing ID is a
+    schema 422, and joining a 9th replica (8 already present) is a 422
+    ``replica_limit_exceeded``.  On failure nothing is changed.  The response
+    is the enlarged history in the ordinary history-read structure.
+    """
+
+    new_replica = body.replica_id
+
+    with store.write_transaction() as conn:
+        row = store.select_for_update(conn, history_id)
+        if row is None:
+            raise HistoryNotFound(history_id)
+        hid, replica_ids, events = _load_row(row)
+
+        if new_replica in set(replica_ids):
+            raise ConflictStateError(
+                [
+                    {
+                        "code": "replica_already_present",
+                        "message": (
+                            f"replica_id {new_replica!r} is already one of "
+                            f"this history's replica_ids {replica_ids}"
+                        ),
+                    }
+                ]
+            )
+        if len(replica_ids) >= 8:
+            raise BatchError(
+                [
+                    _err(
+                        "replica_limit_exceeded",
+                        f"a history holds at most 8 replicas and this one "
+                        f"already has {len(replica_ids)}; no further replica "
+                        "can be admitted",
+                    )
+                ]
+            )
+
+        enlarged_ids = list(replica_ids) + [new_replica]
+        enlarged_events = _events_with_extra_zero_component(
+            events, new_replica
+        )
+
+        # The committed history is valid by construction; re-running the
+        # original validation with the extra zero component asserts that the
+        # enlarged history is replayable as-is.
+        validate_batch(enlarged_ids, enlarged_events)
+
+        # Rewrite the staged events of every session of this history (open
+        # and closed) in the same transaction, so sessions and history always
+        # agree on the replica set.  Staging tolerates incomplete batches, so
+        # the staged events are *not* run through full validation here.
+        rewritten_sessions: dict[str, list[dict]] = {}
+        for srow in store.select_sessions_for_update_by_history(conn, hid):
+            # The session row is still stored under the old replica set, so
+            # parse it against the old IDs before enlarging its clocks.
+            _, _, staged = _load_session_row(srow, replica_ids)
+            staged_enlarged = _events_with_extra_zero_component(
+                staged, new_replica
+            )
+            rewritten_sessions[srow["id"]] = _canonical_events(
+                staged_enlarged, enlarged_ids
+            )
+
+        store.update_history_replica_set(
+            conn,
+            hid,
+            enlarged_ids,
+            _canonical_events(enlarged_events, enlarged_ids),
+        )
+        store.update_session_events_for_history(
+            conn, hid, rewritten_sessions
+        )
+
+        return _history_state(hid, enlarged_ids, enlarged_events)
+
+
 # ---------------------------------------------------------------------------
 # Import sessions (/api/histories/{id}/import-sessions)
 #
@@ -2585,14 +2758,20 @@ def read_import_session(history_id: str, session_id: str) -> dict:
     replica_id then seq.  Unknown history or session IDs get 404.
     """
 
-    row = store.get_history(history_id)
-    if row is None:
-        raise HistoryNotFound(history_id)
-    replica_ids: list[str] = json.loads(row["replica_ids"])
-    srow = store.get_session(history_id, session_id)
-    if srow is None:
-        raise SessionNotFound(session_id)
-    sid, status, staged = _load_session_row(srow, replica_ids)
+    with store.read_transaction() as conn:
+        if conn is None:
+            raise HistoryNotFound(history_id)
+        # One snapshot for both rows, so the replica_ids and the staged
+        # events always come from the same committed state (e.g. never the
+        # pre-admission replica set together with post-admission clocks).
+        row = store.select_for_update(conn, history_id)
+        if row is None:
+            raise HistoryNotFound(history_id)
+        replica_ids: list[str] = json.loads(row["replica_ids"])
+        srow = store.select_session_for_update(conn, history_id, session_id)
+        if srow is None:
+            raise SessionNotFound(session_id)
+        sid, status, staged = _load_session_row(srow, replica_ids)
     return _session_state(sid, history_id, status, staged, replica_ids)
 
 

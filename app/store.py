@@ -194,6 +194,33 @@ def update_events(
     )
 
 
+def update_history_replica_set(
+    conn: sqlite3.Connection,
+    history_id: str,
+    replica_ids: list[str],
+    events: list[dict],
+) -> None:
+    """Replace both the replica set and the events of one history.
+
+    Used by replica admission, which grows ``replica_ids`` and rewrites every
+    stored event clock at the same time; both columns must change in the same
+    statement (and therefore the same transaction) as the import-session rows,
+    so a reader always observes the pre-admission or post-admission state,
+    never a mixture of the two replica sets.
+    """
+
+    import json
+
+    conn.execute(
+        "UPDATE histories SET replica_ids = ?, events = ? WHERE id = ?",
+        (
+            json.dumps(replica_ids, ensure_ascii=False),
+            json.dumps(events, ensure_ascii=False),
+            history_id,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Import sessions: staged offline events, merged into the history on commit
 # ---------------------------------------------------------------------------
@@ -265,4 +292,43 @@ def close_session(conn: sqlite3.Connection, session_id: str) -> None:
     conn.execute(
         "UPDATE import_sessions SET status = 'closed' WHERE id = ?",
         (session_id,),
+    )
+
+
+def select_sessions_for_update_by_history(
+    conn: sqlite3.Connection, history_id: str
+) -> list[sqlite3.Row]:
+    """Every import session owned by one history, locked for the transaction.
+
+    Replica admission rewrites the staged event clocks of *all* of the
+    history's sessions (open and closed) together with the history row.
+    """
+
+    return conn.execute(
+        "SELECT id, history_id, status, events FROM import_sessions "
+        "WHERE history_id = ?",
+        (history_id,),
+    ).fetchall()
+
+
+def update_session_events_for_history(
+    conn: sqlite3.Connection,
+    history_id: str,
+    session_events: dict[str, list[dict]],
+) -> None:
+    """Rewrite the staged events of several sessions of one history.
+
+    Runs in the same serialised transaction as the history's replica-set
+    update, so the sessions and the history can never disagree on which
+    replica set their clock components are keyed to.
+    """
+
+    import json
+
+    conn.executemany(
+        "UPDATE import_sessions SET events = ? WHERE id = ? AND history_id = ?",
+        [
+            (json.dumps(events, ensure_ascii=False), session_id, history_id)
+            for session_id, events in session_events.items()
+        ],
     )
