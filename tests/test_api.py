@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -4738,3 +4739,469 @@ def test_migration_ignores_staged_events_and_leaves_session_untouched():
         ("r1", 1), ("r1", 2), ("r2", 1), ("r2", 2), ("r2", 3),
     }
     assert session_get(hid, sid).json()["status"] == "closed"
+
+
+# ---------------------------------------------------------------------------
+# Admitting a new replica to a persistent history
+# ---------------------------------------------------------------------------
+
+
+def hist_admit(hid, replica_id):
+    return client.post(
+        f"/api/histories/{hid}/replicas", json={"replica_id": replica_id}
+    )
+
+
+def admit_seed_history():
+    """r1/1 put and r2/1 delete conflict on 'name'; r2 also put 'other'."""
+    r = hist_create(
+        ["r1", "r2"],
+        [
+            ev("r1", 1, "name", put="alice", clock={"r1": 1, "r2": 0}),
+            ev("r2", 1, "name", delete="delete", clock={"r1": 0, "r2": 1}),
+            ev("r2", 2, "other", put="q", clock={"r1": 1, "r2": 2}),
+        ],
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def assert_clock_covers(data, replicas):
+    for e in data["events"]:
+        assert set(e["clock"]) == set(replicas)
+    for result in data["results"]:
+        shapes = (
+            result["events"] if result["state"] == "conflict" else [result["event"]]
+        )
+        for shape in shapes:
+            assert set(shape["clock"]) == set(replicas)
+
+
+def test_admit_replica_appends_id_and_zero_components_preserving_verdicts():
+    hid = admit_seed_history()
+    before = hist_get(hid).json()
+
+    r = hist_admit(hid, "r3")
+    assert r.status_code == 200, r.text
+    data = r.json()
+
+    # The new replica is appended to the end; the response is the ordinary
+    # history read structure of the expanded history.
+    assert data["id"] == hid
+    assert data["replica_ids"] == ["r1", "r2", "r3"]
+    assert_clock_covers(data, ["r1", "r2", "r3"])
+
+    # Every committed event gained exactly the r3=0 component; seq, key, op,
+    # value and the old components are unchanged.
+    for old, new in zip(before["events"], data["events"]):
+        assert {k: v for k, v in new["clock"].items() if k != "r3"} == old["clock"]
+        assert new["clock"]["r3"] == 0
+        for field in ("replica_id", "seq", "key"):
+            assert new[field] == old[field]
+        assert ("put" in new) == ("put" in old)
+        assert new.get("put") == old.get("put")
+        assert new.get("delete") == old.get("delete")
+
+    # Key states and values are unchanged (results just carry the new zero).
+    def strip(results):
+        out = json.loads(json.dumps(results))
+        for res in out:
+            shapes = res["events"] if res["state"] == "conflict" else [res["event"]]
+            for s in shapes:
+                s["clock"].pop("r3", None)
+        return out
+
+    assert strip(data["results"]) == strip(before["results"])
+
+    # A plain GET afterwards returns the same expanded state.
+    assert hist_get(hid).json() == data
+
+
+def test_admit_replica_patches_open_and_closed_sessions_without_closing():
+    hid = admit_seed_history()
+    open_sid = create_session(hid)
+    closed_sid = create_session(hid)
+
+    # The open session stages an event whose dependency (r1/3) exists neither
+    # in the history nor in the session: staging tolerates missing deps.
+    assert session_append(
+        hid, open_sid,
+        [ev("r1", 2, "k", put="a", clock={"r1": 2, "r2": 2})],
+    ).status_code == 200
+    # A second open session holds an event pointing at a missing event.
+    gappy_sid = create_session(hid)
+    assert session_append(
+        hid, gappy_sid,
+        [ev("r2", 3, "k", put="b", clock={"r1": 9, "r2": 3})],
+    ).status_code == 200
+
+    # The closed session stages an event, commits, and ends up closed.
+    assert session_append(
+        hid, closed_sid,
+        [ev("r2", 3, "c", put="z", clock={"r1": 1, "r2": 3})],
+    ).status_code == 200
+    assert session_commit(hid, closed_sid).status_code == 200
+    assert session_get(hid, closed_sid).json()["status"] == "closed"
+
+    # Admission must not be blocked by the incomplete open sessions.
+    r = hist_admit(hid, "r3")
+    assert r.status_code == 200, r.text
+
+    open_data = session_get(hid, open_sid).json()
+    closed_data = session_get(hid, closed_sid).json()
+    gappy_data = session_get(hid, gappy_sid).json()
+
+    assert open_data["status"] == "open"
+    assert closed_data["status"] == "closed"
+    assert gappy_data["status"] == "open"
+    for data in (open_data, closed_data, gappy_data):
+        assert len(data["events"]) == 1
+        e = data["events"][0]
+        assert set(e["clock"]) == {"r1", "r2", "r3"}
+        assert e["clock"]["r3"] == 0
+        assert e["clock"][e["replica_id"]] == e["seq"]
+
+    # The committed r2/3 from the closed session made it into the history and
+    # got patched there too.
+    got = hist_get(hid).json()
+    by_id = {(e["replica_id"], e["seq"]): e for e in got["events"]}
+    assert by_id[("r2", 3)]["clock"] == {"r1": 1, "r2": 3, "r3": 0}
+
+
+def test_admit_replica_unknown_history_is_404():
+    r = hist_admit("0" * 32, "r3")
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "history_not_found"
+
+
+def test_admit_replica_duplicate_is_409_and_changes_nothing():
+    hid = admit_seed_history()
+    before = hist_get(hid).json()
+    r = hist_admit(hid, "r2")
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail[0]["code"] == "replica_already_exists"
+    assert detail[0]["replica_id"] == "r2"
+    assert hist_get(hid).json() == before
+
+
+def test_admit_replica_empty_or_missing_id_is_422():
+    hid = admit_seed_history()
+    assert hist_admit(hid, "").status_code == 422
+    assert client.post(
+        f"/api/histories/{hid}/replicas", json={}
+    ).status_code == 422
+    # Extra/unknown fields are rejected by the same schema.
+    assert client.post(
+        f"/api/histories/{hid}/replicas",
+        json={"replica_id": "r3", "extra": 1},
+    ).status_code == 422
+
+
+def test_admit_replica_ninth_member_is_422_and_changes_nothing():
+    replicas = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    clock = {rid: 0 for rid in replicas}
+    clock["a"] = 1
+    r = hist_create(
+        replicas, [ev("a", 1, "k", put="v", clock=clock)]
+    )
+    assert r.status_code == 201, r.text
+    hid = r.json()["id"]
+    before = hist_get(hid).json()
+
+    r = hist_admit(hid, "i")
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["code"] == "replica_limit_exceeded"
+    assert hist_get(hid).json() == before
+
+
+def test_admitted_replica_writes_from_seq_one_with_full_clock_only():
+    hid = admit_seed_history()
+    assert hist_admit(hid, "r3").status_code == 200
+
+    # A missing component is still 422: admission never auto-fills requests.
+    r = hist_merge(
+        hid, [ev("r3", 1, "k", put="v", clock={"r1": 1, "r3": 1})]
+    )
+    assert_422(r, "clock_replica_coverage")
+    assert hist_get(hid).json()["replica_ids"] == ["r1", "r2", "r3"]
+
+    # The full clock works and the new replica starts at seq 1.
+    r = hist_merge(
+        hid,
+        [ev("r3", 1, "fresh", put="new", clock={"r1": 1, "r2": 2, "r3": 1})],
+    )
+    assert r.status_code == 200, r.text
+    by_id = {(e["replica_id"], e["seq"]): e for e in r.json()["events"]}
+    assert by_id[("r3", 1)]["put"] == "new"
+
+    # The next event continues the tail.
+    r = hist_merge(
+        hid,
+        [ev("r3", 2, "fresh", put="new2", clock={"r1": 1, "r2": 2, "r3": 2})],
+    )
+    assert r.status_code == 200, r.text
+    assert ("r3", 2) in {
+        (e["replica_id"], e["seq"]) for e in r.json()["events"]
+    }
+
+
+def test_conflict_commit_and_migration_work_for_admitted_replica():
+    hid = admit_seed_history()
+    assert hist_admit(hid, "r3").status_code == 200
+
+    # The admitted replica resolves the 'name' conflict by writing r3/1.
+    r = hist_commit(
+        hid,
+        key="name",
+        writer="r3",
+        versions=[{"replica_id": "r1", "seq": 1}, {"replica_id": "r2", "seq": 1}],
+        put="chosen",
+    )
+    assert r.status_code == 200, r.text
+    event = r.json()["event"]
+    assert event["replica_id"] == "r3" and event["seq"] == 1
+    assert event["clock"] == {"r1": 1, "r2": 1, "r3": 1}
+
+
+def test_open_session_continues_after_admission_and_commits():
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "name", put="alice", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+    # r1/2 staged before admission with the old two-component clock.
+    assert session_append(
+        hid, sid,
+        [ev("r1", 2, "name", put="alice2", clock={"r1": 2, "r2": 0})],
+    ).status_code == 200
+
+    assert hist_admit(hid, "r3").status_code == 200
+
+    # The session stays open and its staged event now carries r3=0.
+    data = session_get(hid, sid).json()
+    assert data["status"] == "open"
+    assert data["events"][0]["clock"] == {"r1": 2, "r2": 0, "r3": 0}
+
+    # Retransmitting the staged identity with the OLD clock is different full
+    # content after admission -> 409 (never silently re-patched per request).
+    r = session_append(
+        hid, sid,
+        [ev("r1", 2, "name", put="alice2", clock={"r1": 2, "r2": 0})],
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"][0]["code"] == "event_content_mismatch"
+
+    # The patched (stored) three-component form is identical -> ignored.
+    assert session_append(
+        hid, sid,
+        [ev("r1", 2, "name", put="alice2", clock={"r1": 2, "r2": 0, "r3": 0})],
+    ).status_code == 200
+
+    # A genuinely new staged identity must already cover the full new set.
+    r = session_append(
+        hid, sid,
+        [ev("r1", 3, "name", put="alice3", clock={"r1": 3, "r2": 0})],
+    )
+    assert_422(r, "clock_replica_coverage")
+    assert session_append(
+        hid, sid,
+        [ev("r1", 3, "name", put="alice3", clock={"r1": 3, "r2": 0, "r3": 0})],
+    ).status_code == 200
+
+    # The same session commits and closes; staged events merge with the
+    # post-admission full clocks.
+    r = session_commit(hid, sid)
+    assert r.status_code == 200, r.text
+    assert [(e["replica_id"], e["seq"]) for e in r.json()["events"]] == [
+        ("r1", 1), ("r1", 2), ("r1", 3)
+    ]
+    assert session_get(hid, sid).json()["status"] == "closed"
+
+
+def test_admission_failure_rolls_back_history_and_all_sessions():
+    hid = admit_seed_history()
+    sid = create_session(hid)
+    assert session_append(
+        hid, sid,
+        [ev("r1", 4, "k", put="a", clock={"r1": 4, "r2": 2})],
+    ).status_code == 200
+    before = hist_get(hid).json()
+    session_before = session_get(hid, sid).json()
+
+    # Duplicate admission -> 409: nothing patched anywhere.
+    assert hist_admit(hid, "r1").status_code == 409
+    assert hist_get(hid).json() == before
+    assert session_get(hid, sid).json() == session_before
+
+
+def test_admission_does_not_touch_other_histories():
+    hid = admit_seed_history()
+    other = admit_seed_history()
+    other_before = hist_get(other).json()
+
+    assert hist_admit(hid, "r3").status_code == 200
+    assert hist_get(other).json() == other_before
+
+
+def test_admission_survives_process_restart(tmp_path):
+    db = tmp_path / "history.db"
+    env = dict(os.environ, HISTORY_DB_PATH=str(db), PYTHONPATH="/workspace")
+
+    def run(code):
+        return subprocess.run(
+            [sys.executable, "-c", code],
+            env=env, capture_output=True, text=True,
+        )
+
+    first = run(
+        """
+from fastapi.testclient import TestClient
+from app.main import app
+
+c = TestClient(app)
+r = c.post('/api/histories', json={
+    'replica_ids': ['r1', 'r2'],
+    'events': [
+        {'replica_id': 'r1', 'seq': 1, 'key': 'name', 'put': 'alice',
+         'clock': {'r1': 1, 'r2': 0}},
+    ],
+})
+hid = r.json()['id']
+r = c.post(f'/api/histories/{hid}/import-sessions')
+sid = r.json()['id']
+r = c.post(f'/api/histories/{hid}/import-sessions/{sid}/events', json={
+    'events': [
+        {'replica_id': 'r1', 'seq': 2, 'key': 'name', 'put': 'alice2',
+         'clock': {'r1': 2, 'r2': 0}},
+    ],
+})
+assert r.status_code == 200, r.text
+r = c.post(f'/api/histories/{hid}/replicas', json={'replica_id': 'r3'})
+assert r.status_code == 200, r.text
+assert r.json()['replica_ids'] == ['r1', 'r2', 'r3']
+print(hid, sid)
+"""
+    )
+    assert first.returncode == 0, first.stderr
+    hid, sid = first.stdout.split()
+
+    second = run(
+        f"""
+from fastapi.testclient import TestClient
+from app.main import app
+
+c = TestClient(app)
+r = c.get('/api/histories/{hid}')
+assert r.status_code == 200, r.text
+data = r.json()
+assert data['replica_ids'] == ['r1', 'r2', 'r3']
+assert data['events'][0]['clock'] == {{'r1': 1, 'r2': 0, 'r3': 0}}
+
+# The open session and its patched staged events survived the restart.
+r = c.get('/api/histories/{hid}/import-sessions/{sid}')
+assert r.status_code == 200, r.text
+sdata = r.json()
+assert sdata['status'] == 'open'
+assert sdata['events'][0]['clock'] == {{'r1': 2, 'r2': 0, 'r3': 0}}
+
+# The admitted replica writes seq 1 after the restart.
+r = c.post('/api/histories/{hid}/events', json={{
+    'events': [
+        {{'replica_id': 'r3', 'seq': 1, 'key': 'name', 'put': 'carol',
+         'clock': {{'r1': 1, 'r2': 0, 'r3': 1}}}},
+    ],
+}})
+assert r.status_code == 200, r.text
+print('ok')
+"""
+    )
+    assert second.returncode == 0, second.stderr
+    assert second.stdout.strip() == "ok"
+
+
+def test_admission_concurrent_with_session_commit_loses_nothing():
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="start", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = create_session(hid)
+    assert session_append(
+        hid, sid,
+        [ev("r2", 1, "k", put="b", clock={"r1": 1, "r2": 1})],
+    ).status_code == 200
+    barrier = threading.Barrier(3)
+
+    def admit():
+        c = TestClient(app)
+        barrier.wait()
+        return c.post(f"/api/histories/{hid}/replicas", json={"replica_id": "r3"})
+
+    def commit_session():
+        c = TestClient(app)
+        barrier.wait()
+        return c.post(f"/api/histories/{hid}/import-sessions/{sid}/commit")
+
+    def idempotent_merge():
+        # r2/1 is the session's event; whichever serialisation order wins,
+        # eventually the three-component identical retransmission is ignored.
+        c = TestClient(app)
+        barrier.wait()
+        for _ in range(50):
+            r = c.post(
+                f"/api/histories/{hid}/events",
+                json={"events": [
+                    ev("r2", 1, "k", put="b",
+                       clock={"r1": 1, "r2": 1, "r3": 0}),
+                ]},
+            )
+            if r.status_code == 200:
+                return r
+        return r
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        r_admit, r_commit, r_merge = list(
+            pool.map(lambda f: f(), [admit, commit_session, idempotent_merge])
+        )
+
+    assert r_admit.status_code == 200, r_admit.text
+    assert r_commit.status_code == 200, r_commit.text
+    assert r_merge.status_code == 200, r_merge.text
+
+    got = hist_get(hid).json()
+    assert got["replica_ids"] == ["r1", "r2", "r3"]
+    by_id = {(e["replica_id"], e["seq"]): e for e in got["events"]}
+    assert set(by_id) == {("r1", 1), ("r2", 1)}
+    assert by_id[("r1", 1)]["clock"] == {"r1": 1, "r2": 0, "r3": 0}
+    assert by_id[("r2", 1)]["clock"] == {"r1": 1, "r2": 1, "r3": 0}
+    assert session_get(hid, sid).json()["status"] == "closed"
+
+
+def test_concurrent_reads_never_observe_mixed_replica_sets():
+    hid = admit_seed_history()
+
+    def read_until_done(stop):
+        c = TestClient(app)
+        seen = set()
+        while not stop.is_set():
+            data = c.get(f"/api/histories/{hid}").json()
+            replicas = set(data["replica_ids"])
+            # Each response must be internally consistent: every event clock
+            # covers exactly the replica_ids the same response carries.
+            for e in data["events"]:
+                assert set(e["clock"]) == replicas
+            assert replicas in ({"r1", "r2"}, {"r1", "r2", "r3"})
+            seen.add(tuple(data["replica_ids"]))
+        return seen
+
+    stop = threading.Event()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(read_until_done, stop) for _ in range(4)]
+        time.sleep(0.05)
+        r = hist_admit(hid, "r3")
+        assert r.status_code == 200, r.text
+        time.sleep(0.05)
+        stop.set()
+        seen_sets = [f.result() for f in futures]
+
+    assert any(("r1", "r2", "r3") in s for s in seen_sets)

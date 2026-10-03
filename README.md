@@ -94,6 +94,21 @@ clock 非零分量所指事件**；依赖会跨 key 延伸，因此闭包中可�
 会话暂存），查询不改动历史或会话；历史或事件不存在返回 **404**，标识非法返回
 **422**。
 
+持久历史还支持**在线接纳新副本**（`POST /api/histories/{id}/replicas`）：已创建
+的历史可以再加入一个副本，**已有导入会话无需先封闭**（开放与封闭会话都保留）。
+请求体只带新副本 ID；新副本追加到 `replica_ids` **末尾**，并为**已提交事件**与
+该历史**所有开放、封闭会话的暂存事件**的 clock **补入该副本的零分量**——原
+`seq`、`key`、操作、值、已有 clock 分量以及会话 ID 与状态全部不变，因此已有
+键的裁决与值不变。暂存允许缺依赖，接入**不跑完整批次校验**，会话没收齐也不
+阻止接入。历史行与全部会话行在**同一个串行化事务**中更新，读取要么看到接入
+前、要么看到接入后的完整副本集合（历史与会话取自同一快照，不会混用），与旧
+汇入、暂存及提交并发不会丢事件，失败一律回滚。成功后返回**扩容后的原历史读取
+结构**；新副本可从 `seq=1` 起经旧接口写入，之后所有写入仍按**完整 clock**
+规则校验（clock 必须恰好覆盖全部副本，服务端**不自动补**请求中缺失的分量）；
+接入结果随 SQLite 持久化，重启后保留；其他历史不受影响；**只支持加入，不支持
+移除或改名**。历史不存在 **404**，副本已在集合中 **409**，空副本 ID 或加入后
+超过 **8** 个副本 **422**。
+
 ## 启动
 
 需要 Docker 与 Docker Compose v2（`docker compose` 子命令）。
@@ -129,6 +144,7 @@ docker compose down
 | 查询仍需补取的缺口区间（只读，不提交） | `GET http://localhost:8000/api/histories/{id}/import-sessions/{sid}/missing-ranges` |
 | 提取指定键的因果证据批次（只读，可直接重放） | `POST http://localhost:8000/api/histories/{id}/evidence-batch` |
 | 解释两条事件的因果关系（只读，可跨 key） | `POST http://localhost:8000/api/histories/{id}/event-relation` |
+| 接纳新副本（追加到 replica_ids，扩展全部 clock 与会话暂存） | `POST http://localhost:8000/api/histories/{id}/replicas` |
 | Swagger UI | <http://localhost:8000/docs> |
 | OpenAPI 文档 | <http://localhost:8000/openapi.json> |
 
@@ -2113,6 +2129,267 @@ curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/event-relation" \
 整个查询过程不产生任何写入：再 `GET` 历史，事件与裁决均与查询前一致；暂存在
 导入会话中、尚未提交的事件不参与比较（按暂存事件的标识查询会得到 404
 `event_not_found`）。
+
+## 新副本接入接口 `POST /api/histories/{id}/replicas`
+
+已创建的持久历史可以**在线再接纳一个副本**，接入时**不必封闭任何导入会话**。
+请求体只含新副本 ID：
+
+```json
+{ "replica_id": "r3" }
+```
+
+接入在**同一个 `BEGIN IMMEDIATE` 事务**内完成下列全部改动，要么一起生效、要么
+全部回滚：
+
+- 新副本 ID 追加到历史 `replica_ids` 的**末尾**（顺序影响 clock 分量的返回顺序，
+  不影响语义）；
+- 历史的**每条已提交事件**的 clock 补入 `新副本: 0` 分量；
+- 该历史**每个导入会话**——无论 `open` 还是 `closed`——的**每条暂存事件**同样
+  补入 `新副本: 0` 分量；会话 ID、`status`、暂存条数都不变。
+- 原 `seq`、`key`、操作（put/delete）、值与 clock 的**已有分量原样不变**；
+  补入的全是零分量，不改变任何已有事件之间的偏序关系，因此**已有键的状态与值
+  不变**（`results` 只多出一个零分量）。
+
+接入**不做**完整批次校验：暂存本来就允许缺前序/跨副本依赖，会话没收齐不能阻止
+接入。成功响应就是**扩容后的原历史读取结构**（`id`、`replica_ids`、排序后的
+完整 `events`、`results`）。
+
+接入之后：
+
+- 新副本可从 **`seq=1`** 起经原有写接口（`/events` 汇入、`/resolve-conflict`、
+  `/migrate-key`，或导入会话暂存/提交）写入；
+- 该历史**后续所有写入仍按完整 clock 规则校验**：clock 必须恰好覆盖扩容后的
+  全部副本，服务端**不会**替请求自动补缺失的分量（缺分量仍是
+  `clock_replica_coverage`，422）；
+- 接入结果落在同一 SQLite 文件中，容器重启后保留；**其他历史完全不受影响**；
+- 只支持**加入**，不提供移除或改名。
+
+状态码：
+
+- **200**：接入成功，返回扩容后的历史读取结构；
+- **404**：历史不存在（`history_not_found`）；
+- **409**：该副本已在 `replica_ids` 中（`replica_already_exists`，错误项带
+  `replica_id`）；
+- **422**：`replica_id` 为空/缺失/非字符串（请求体 schema 校验），或接入后
+  副本数超过 **8**（`replica_limit_exceeded`）。
+
+并发与一致性：历史行与全部会话行在同一串行化事务内更新，与旧汇入、冲突提交、
+会话暂存/提交互斥，不会丢事件、不会分配重复 seq；读取端历史与会话使用**同一
+已提交快照**，只能看到接入前或接入后的完整状态，不会出现"历史已含新副本、
+暂存 clock 却没有新分量"（或反过来）的混用状态。
+
+### 27. 接入新副本：开放/封闭会话都不关闭，已提交与暂存事件统一补零分量
+
+先创建一份两副本冲突历史：`r1/1` 与 `r2/1` 并发写 `name`：
+
+```bash
+HID=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2"],
+    "events": [
+      {"replica_id": "r2", "seq": 1, "key": "name",
+       "delete": "delete", "clock": {"r1": 0, "r2": 1}},
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 1, "r2": 0}}
+    ]
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+```
+
+开两个会话：`SID1` 暂存一条**缺前序也没关系**的事件并保持开放；`SID2` 暂存一条
+事件后提交（提交后会话封闭，用于观察封闭会话同样被补分量）：
+
+```bash
+SID1=$(curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+SID2=$(curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# 开放会话：暂存 r1/2（暂存允许依赖暂不完整）
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID1/events" \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+    {"replica_id": "r1", "seq": 2, "key": "other", "put": "p",
+     "clock": {"r1": 2, "r2": 1}}
+  ]}' > /dev/null
+
+# 第二个会话暂存 r2/2 后提交 -> 封闭，r2/2 进入已提交历史
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID2/events" \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+    {"replica_id": "r2", "seq": 2, "key": "other", "put": "q",
+     "clock": {"r1": 1, "r2": 2}}
+  ]}' > /dev/null
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID2/commit" \
+  > /dev/null
+```
+
+接入新副本 `r3`——两个会话都**不需要**关闭：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/replicas" \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_id": "r3"}'
+```
+
+响应是扩容后的原历史读取结构：`replica_ids` 末尾追加 `r3`；三条已提交事件的
+clock 全部多出 `"r3": 0`，其余字段一字未动；`name` 仍是原来的冲突裁决（只是
+裁决事件的 clock 多了零分量），`other` 仍是 put：
+
+```json
+{
+  "id": "…",
+  "replica_ids": ["r1", "r2", "r3"],
+  "events": [
+    {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+     "clock": {"r1": 1, "r2": 0, "r3": 0}},
+    {"replica_id": "r2", "seq": 1, "key": "name",
+     "delete": "delete", "clock": {"r1": 0, "r2": 1, "r3": 0}},
+    {"replica_id": "r2", "seq": 2, "key": "other", "put": "q",
+     "clock": {"r1": 1, "r2": 2, "r3": 0}}
+  ],
+  "results": [ "……键状态与值同接入前完全一致，仅 clock 多 r3:0……" ]
+}
+```
+
+`r1/2` 当时只在开放会话 `SID1` 中暂存、并未提交，因此它**不在**上面的已提交
+`events` 中；它只出现在会话读取结果里（同样已补 `r3:0`）。
+
+会话侧也一起补了分量，状态不变——开放会话仍开放、封闭会话仍封闭：
+
+```bash
+# 开放会话：暂存事件已带 r3:0，status 仍为 open
+curl -sS "http://localhost:8000/api/histories/$HID/import-sessions/$SID1"
+# 封闭会话：暂存事件同样已带 r3:0，status 仍为 closed
+curl -sS "http://localhost:8000/api/histories/$HID/import-sessions/$SID2"
+```
+
+### 28. 续提同一个开放会话：新事件必须带完整 clock，随后提交
+
+接入后继续向 `SID1` 暂存事件。补齐此前缺失的依赖后，新事件的 clock 必须
+**恰好覆盖三个副本**（服务端不替请求补分量）：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID1/events" \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+    {"replica_id": "r1", "seq": 3, "key": "other", "put": "p3",
+     "clock": {"r1": 3, "r2": 2, "r3": 0}}
+  ]}'
+```
+
+提交同一个会话即可把暂存事件（接入前暂存的 `r1/2` 已自动带 `r3:0`）汇入历史，
+会话随之封闭：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID1/commit"
+```
+
+```json
+{
+  "id": "…",
+  "replica_ids": ["r1", "r2", "r3"],
+  "events": [
+    {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+     "clock": {"r1": 1, "r2": 0, "r3": 0}},
+    {"replica_id": "r1", "seq": 2, "key": "other", "put": "p",
+     "clock": {"r1": 2, "r2": 1, "r3": 0}},
+    {"replica_id": "r1", "seq": 3, "key": "other", "put": "p3",
+     "clock": {"r1": 3, "r2": 2, "r3": 0}},
+    {"replica_id": "r2", "seq": 1, "key": "name",
+     "delete": "delete", "clock": {"r1": 0, "r2": 1, "r3": 0}},
+    {"replica_id": "r2", "seq": 2, "key": "other", "put": "q",
+     "clock": {"r1": 1, "r2": 2, "r3": 0}}
+  ],
+  "results": [ "……" ]
+}
+```
+
+注意接入后若再用**旧的两分量 clock** 重传一个已暂存/已提交标识，按完整内容
+判等会因缺少 `r3` 分量而得到 **409** `event_content_mismatch`（重传必须使用
+接入后的三分量形式）；这与既有重传规则一致。
+
+### 29. 新副本从 seq=1 写入；clock 缺分量仍是 422，服务端不自动补
+
+`r3` 从 `seq=1` 开始写入，经原有汇入接口即可（clock 覆盖全部三个副本）：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/events" \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+    {"replica_id": "r3", "seq": 1, "key": "name", "put": "carol",
+     "clock": {"r1": 3, "r2": 2, "r3": 1}}
+  ]}'
+```
+
+返回 200，历史读取结构中出现 `r3/1`。接入**不会**放宽后续写入的 clock 规则——
+请求里漏掉任一副本分量仍是 **422**（不会被当作 0 自动补入）：
+
+```bash
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/events" \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+    {"replica_id": "r3", "seq": 2, "key": "other", "put": "x",
+     "clock": {"r1": 3, "r3": 2}}
+  ]}'
+# 422 Unprocessable Entity，code=clock_replica_coverage（缺少 r2 分量）
+```
+
+冲突提交与键迁移同样适用：写入副本可直接指定为 `r3`，其 `versions`/生成事件的
+clock 都按扩容后的三副本计算（例如
+`POST /api/histories/{id}/resolve-conflict`，body 中
+`"replica_id": "r3"`）。
+
+### 30. 失败情形：404 / 409 / 422，失败不改动；重启后保留
+
+```bash
+# 历史不存在 -> 404 history_not_found
+curl -sS -i -X POST \
+  http://localhost:8000/api/histories/00000000000000000000000000000000/replicas \
+  -H 'Content-Type: application/json' -d '{"replica_id": "r9"}'
+
+# r3 已是成员 -> 409 replica_already_exists，且不改动任何数据
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/replicas" \
+  -H 'Content-Type: application/json' -d '{"replica_id": "r3"}'
+
+# 空副本 ID -> 422（请求体校验）
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/replicas" \
+  -H 'Content-Type: application/json' -d '{"replica_id": ""}'
+
+# 8 副本上限：建一份已有 8 个副本的历史，再接入第 9 个
+# -> 422 replica_limit_exceeded
+HID8=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{"replica_ids": ["a","b","c","d","e","f","g","h"],
+       "events": [
+         {"replica_id": "a", "seq": 1, "key": "k", "put": "v",
+          "clock": {"a":1,"b":0,"c":0,"d":0,"e":0,"f":0,"g":0,"h":0}}
+       ]}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID8/replicas" \
+  -H 'Content-Type: application/json' -d '{"replica_id": "i"}'
+```
+
+```json
+{
+  "detail": [
+    {
+      "code": "replica_already_exists",
+      "message": "replica 'r3' is already a member of this history's replica_ids; a replica can only be admitted once",
+      "replica_id": "r3"
+    }
+  ]
+}
+```
+
+任一失败都在事务内回滚：再 `GET` 历史，`replica_ids`、事件、裁决及全部会话
+（含暂存内容与状态）都与请求前一致。
+
+接入结果与历史、会话一样持久化在 SQLite 命名卷中，`docker compose restart`
+后按原 ID 读取仍是扩容后的三副本历史；接入前后创建的**其他历史**的
+`replica_ids` 与 clock 完全不变。系统只提供加入能力，没有移除或改名副本的
+接口。
 
 ## 本地开发（不使用 Docker）
 

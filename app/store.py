@@ -194,6 +194,31 @@ def update_events(
     )
 
 
+def update_replica_ids_and_events(
+    conn: sqlite3.Connection,
+    history_id: str,
+    replica_ids: list[str],
+    events: list[dict],
+) -> None:
+    """Persist an expanded replica set together with the rewritten events.
+
+    Both columns live on the same row and are written by one UPDATE inside
+    the caller's serialised transaction, so a reader can never observe the
+    new replica set with the old clocks (or vice versa).
+    """
+
+    import json
+
+    conn.execute(
+        "UPDATE histories SET replica_ids = ?, events = ? WHERE id = ?",
+        (
+            json.dumps(replica_ids, ensure_ascii=False),
+            json.dumps(events, ensure_ascii=False),
+            history_id,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Import sessions: staged offline events, merged into the history on commit
 # ---------------------------------------------------------------------------
@@ -266,3 +291,19 @@ def close_session(conn: sqlite3.Connection, session_id: str) -> None:
         "UPDATE import_sessions SET status = 'closed' WHERE id = ?",
         (session_id,),
     )
+
+
+def select_sessions_for_update(
+    conn: sqlite3.Connection, history_id: str
+) -> list[sqlite3.Row]:
+    """All import sessions (open and closed) owned by one history.
+
+    Admitting a new replica rewrites the staged clocks of every session, so
+    all of them are read within the same serialised transaction.
+    """
+
+    return conn.execute(
+        "SELECT id, history_id, status, events FROM import_sessions "
+        "WHERE history_id = ? ORDER BY id",
+        (history_id,),
+    ).fetchall()
